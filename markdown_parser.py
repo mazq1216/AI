@@ -95,6 +95,11 @@ class MarkdownParser:
 
         metadata_lines, step_blocks = self._split_metadata_and_steps(lines[1:])
         fields = self._parse_key_values(metadata_lines)
+        steps = [self.parse_step(block) for block in step_blocks]
+        steps.sort(key=self._step_sort_key)
+        step_ids = [step.id for step in steps]
+        if len(step_ids) != len(set(step_ids)):
+            raise ValueError(f"Ability '{match.group('name')}' has duplicate Step IDs")
         workflow = Workflow(
             ability=match.group("name"),
             name=self._required(fields, "Name", "Ability"),
@@ -104,7 +109,7 @@ class MarkdownParser:
                 fields.get("ExternalParameters", "[]")
             ),
             version=self._optional(fields, "Version"),
-            steps=[self.parse_step(block) for block in step_blocks],
+            steps=steps,
         )
         return workflow
 
@@ -200,15 +205,21 @@ class MarkdownParser:
             "steps": dict(step_results or {}),
         }
 
-        plan: List[Dict[str, Any]] = []
-        for step in workflow.steps:
-            request: Dict[str, Any] = {
-                "toolType": step.tool_type,
-                "TargetName": step.target_name,
-            }
-            request.update(self._resolve_value(step.parameters, context))
-            plan.append(request)
-        return plan
+        return [
+            self.build_step_request(step, context)
+            for step in workflow.steps
+        ]
+
+    def build_step_request(
+        self, step: Step, context: Mapping[str, Any]
+    ) -> Dict[str, Any]:
+        """Assign current context values to one trusted Step definition."""
+        request: Dict[str, Any] = {
+            "toolType": step.tool_type,
+            "TargetName": step.target_name,
+        }
+        request.update(self._resolve_value(step.parameters, context))
+        return request
 
     def select_ability(
         self,
@@ -239,15 +250,28 @@ class MarkdownParser:
         self, workflow: Workflow, supplied: Mapping[str, Any]
     ) -> Dict[str, Any]:
         """Normalize canonical names/aliases and validate required external values."""
+        accepted_names = {
+            name
+            for definition in workflow.external_parameters
+            for name in [definition.name, *definition.aliases]
+        }
+        unknown = sorted(set(supplied) - accepted_names)
+        if unknown:
+            raise ValueError("Unknown external parameters: " + ", ".join(unknown))
+
         bound: Dict[str, Any] = {}
         missing: List[str] = []
         for definition in workflow.external_parameters:
             candidates = [definition.name, *definition.aliases]
             found = next((name for name in candidates if name in supplied), None)
             if found is not None:
-                bound[definition.name] = supplied[found]
+                bound[definition.name] = self._coerce_parameter(
+                    supplied[found], definition
+                )
             elif definition.default is not None:
-                bound[definition.name] = definition.default
+                bound[definition.name] = self._coerce_parameter(
+                    definition.default, definition
+                )
             elif definition.required:
                 missing.append(definition.name)
             else:
@@ -258,6 +282,60 @@ class MarkdownParser:
                 "Missing required external parameters: " + ", ".join(missing)
             )
         return bound
+
+    def _coerce_parameter(
+        self, value: Any, definition: ExternalParameter
+    ) -> Any:
+        if value is None:
+            if definition.required:
+                raise ValueError(
+                    f"External parameter '{definition.name}' cannot be null"
+                )
+            return None
+
+        expected = definition.type.lower()
+        try:
+            if expected == "string":
+                if isinstance(value, (dict, list)):
+                    raise TypeError
+                return str(value)
+            if expected == "integer":
+                if isinstance(value, bool):
+                    raise TypeError
+                return int(value)
+            if expected == "number":
+                if isinstance(value, bool):
+                    raise TypeError
+                return float(value)
+            if expected == "boolean":
+                if isinstance(value, bool):
+                    return value
+                if isinstance(value, str):
+                    normalized = value.strip().lower()
+                    if normalized in {"true", "yes", "1", "是", "允许"}:
+                        return True
+                    if normalized in {"false", "no", "0", "否", "不允许"}:
+                        return False
+                if value in (0, 1):
+                    return bool(value)
+                raise TypeError
+            if expected == "object" and isinstance(value, Mapping):
+                return dict(value)
+            if expected == "array" and isinstance(value, list):
+                return value
+            if expected not in {"object", "array"}:
+                raise ValueError(
+                    f"Unsupported type '{definition.type}' for "
+                    f"external parameter '{definition.name}'"
+                )
+            raise TypeError
+        except (TypeError, ValueError) as exc:
+            if isinstance(exc, ValueError) and str(exc).startswith("Unsupported type"):
+                raise
+            raise ValueError(
+                f"External parameter '{definition.name}' must be "
+                f"{definition.type}, got {value!r}"
+            ) from exc
 
     @staticmethod
     def parse_variable(text: str) -> List[str]:
@@ -329,6 +407,10 @@ class MarkdownParser:
         if current:
             steps.append(current)
         return metadata, steps
+
+    def _step_sort_key(self, step: Step) -> Tuple[int, str]:
+        match = re.search(r"\d+", step.id)
+        return (int(match.group()) if match else 2**31, step.id)
 
     def _parse_key_values(self, lines: List[str]) -> Dict[str, str]:
         fields: Dict[str, str] = {}
