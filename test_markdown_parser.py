@@ -1,78 +1,112 @@
 import unittest
+from pathlib import Path
 
 from markdown_parser import MarkdownParser
 
 
-SAMPLE = """# Ability: gauss_lock
-Name: GaussDB锁等待诊断
-Description: 用于分析GaussDB锁等待及阻塞链。
-Version: 1.0
-Trigger:
-- block
-- lock
-- deadlock
-Tags:
-- database
-- gaussdb
-
-## Step1
-Name: 查询阻塞信息
-Tool: sql
-Description:
-查询数据库当前阻塞链。
-SQL:
-SELECT *
-FROM pg_stat_activity
-WHERE datname = '{{database}}';
-Output:
-step1.result
-
-## Step2
-Name: 生成总结
-Tool: llm
-System:
-你是一名数据库专家。
-User:
-请总结以下结果：{{step1.result}}
-Input:
-{{step1.result}}
-Retry: 3
-Timeout: 30
-OnError: retry
-"""
+DIAGNOSIS_PATH = Path(__file__).with_name("diagnosis.md")
 
 
 class MarkdownParserTests(unittest.TestCase):
-    def test_parse_workflow(self) -> None:
-        parser = MarkdownParser()
-        workflows = parser.parse(SAMPLE)
-        self.assertEqual(len(workflows), 1)
+    def setUp(self) -> None:
+        self.parser = MarkdownParser()
+        self.markdown = DIAGNOSIS_PATH.read_text(encoding="utf-8")
 
+    def test_parse_v3_ability_and_steps(self) -> None:
+        workflows = self.parser.parse(self.markdown)
+
+        self.assertEqual(len(workflows), 2)
         workflow = workflows[0]
-        self.assertEqual(workflow.ability, "gauss_lock")
-        self.assertEqual(workflow.version, "1.0")
-        self.assertEqual(workflow.trigger, ["block", "lock", "deadlock"])
-        self.assertEqual(workflow.tags, ["database", "gaussdb"])
-        self.assertEqual(len(workflow.steps), 2)
-
-        first = workflow.steps[0]
-        self.assertEqual(first.tool, "sql")
-        self.assertIn("pg_stat_activity", first.sql or "")
-        self.assertIn("database", first.variables())
-
-        second = workflow.steps[1]
-        self.assertEqual(second.tool, "llm")
-        self.assertIsNotNone(second.prompt)
-        self.assertEqual(second.retry, 3)
-        self.assertEqual(second.timeout, 30)
-        self.assertEqual(second.on_error, "retry")
-
-    def test_parse_variable(self) -> None:
-        text = "A={{user_input}} B={{ step1.result }} C={{current_time}}"
+        self.assertEqual(workflow.ability, "database_lock_wait")
+        self.assertIn("数据库锁等待", workflow.keywords)
+        self.assertEqual(len(workflow.external_parameters), 6)
+        self.assertEqual(len(workflow.steps), 3)
+        self.assertEqual(workflow.steps[0].tool_type, "orchestration")
         self.assertEqual(
-            MarkdownParser.parse_variable(text),
-            ["user_input", "step1.result", "current_time"],
+            workflow.steps[0].target_name, "db_lock_keyword_orchestration"
         )
+        self.assertEqual(workflow.steps[1].tool_type, "operation")
+
+    def test_build_plan_assigns_external_parameters_and_defaults(self) -> None:
+        user_input = (
+            "生产库10.10.20.15出现锁等待，数据库名称order_prod，"
+            "登录用户diagnosis_user，请先诊断。"
+        )
+        plan = self.parser.build_execution_plan(
+            self.markdown,
+            user_input,
+            {
+                "db_ip": "10.10.20.15",
+                "db_name": "order_prod",
+                "db_user": "diagnosis_user",
+            },
+        )
+
+        self.assertEqual(
+            plan[0],
+            {
+                "toolType": "orchestration",
+                "TargetName": "db_lock_keyword_orchestration",
+                "db_ip": "10.10.20.15",
+                "db_port": 5432,
+                "db_name": "order_prod",
+                "db_user": "diagnosis_user",
+                "db_password": None,
+                "problem_description": user_input,
+            },
+        )
+        self.assertEqual(plan[1]["toolType"], "operation")
+        self.assertEqual(
+            plan[1]["blocking_session_id"],
+            "{{steps.Step1.result.blocking_session_id}}",
+        )
+
+    def test_aliases_are_accepted_for_llm_extracted_values(self) -> None:
+        plan = self.parser.build_execution_plan(
+            self.markdown,
+            "数据库出现锁等待",
+            {
+                "数据库IP": "192.168.1.20",
+                "数据库名称": "billing",
+                "登录用户": "ops_user",
+            },
+        )
+
+        self.assertEqual(plan[0]["db_ip"], "192.168.1.20")
+        self.assertEqual(plan[0]["db_name"], "billing")
+        self.assertEqual(plan[0]["db_user"], "ops_user")
+
+    def test_previous_step_result_can_be_assigned(self) -> None:
+        plan = self.parser.build_execution_plan(
+            self.markdown,
+            "数据库锁等待",
+            {
+                "db_ip": "10.0.0.8",
+                "db_name": "orders",
+                "db_user": "diagnosis",
+            },
+            step_results={
+                "Step1": {
+                    "result": {
+                        "blocking_session_id": "9876",
+                        "summary": "found blocker",
+                    }
+                }
+            },
+        )
+
+        self.assertEqual(plan[1]["blocking_session_id"], "9876")
+        self.assertEqual(plan[2]["diagnosis_result"]["summary"], "found blocker")
+
+    def test_missing_required_external_parameter_is_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError, "Missing required external parameters: db_user"
+        ):
+            self.parser.build_execution_plan(
+                self.markdown,
+                "数据库锁等待",
+                {"db_ip": "10.0.0.8", "db_name": "orders"},
+            )
 
 
 if __name__ == "__main__":

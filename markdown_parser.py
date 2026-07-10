@@ -1,212 +1,301 @@
-"""Markdown parser for diagnosis workflow definitions.
-
-The parser follows the conventions described in the uploaded specification:
-- Ability sections start with '# Ability: <ability_name>'
-- Steps start with '## <step_id>'
-- Metadata uses 'Key: Value' form
-- List values are declared as bullet items right after 'Trigger:' / 'Tags:'
-- Variables are referenced as '{{variable_name}}'
-"""
+"""Parse diagnosis abilities and build local automation platform requests."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import json
 import re
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 
 VARIABLE_PATTERN = re.compile(r"\{\{\s*([^}]+?)\s*\}\}")
-ABILITY_HEADER_PATTERN = re.compile(r"^#\s+Ability:\s*(?P<ability>[A-Za-z0-9_\-\.]+)\s*$")
-STEP_HEADER_PATTERN = re.compile(r"^##\s+(?P<step_id>[A-Za-z0-9_\-\.]+)\s*$")
+ABILITY_HEADER_PATTERN = re.compile(r"^#\s+Ability:\s*(?P<name>[\w.-]+)\s*$")
+STEP_HEADER_PATTERN = re.compile(r"^##\s+(?P<name>Step[\w.-]*)\s*$", re.IGNORECASE)
 
 
 @dataclass
-class Prompt:
-    """Prompt definition for llm steps."""
+class ExternalParameter:
+    """A value extracted by the LLM and supplied to the parser."""
 
-    system: Optional[str] = None
-    user: Optional[str] = None
-    input: Optional[str] = None
-
-    def variables(self) -> List[str]:
-        collected = []
-        for value in (self.system, self.user, self.input):
-            if value:
-                collected.extend(MarkdownParser.parse_variable(value))
-        return sorted(set(collected))
+    name: str
+    type: str = "string"
+    required: bool = False
+    default: Any = None
+    aliases: List[str] = field(default_factory=list)
+    description: str = ""
+    secret: bool = False
 
 
 @dataclass
 class Step:
-    """Workflow step definition."""
+    """One ordered automation-platform invocation."""
 
     id: str
     name: str
-    tool: str
+    tool_type: str
+    target_name: str
+    parameters: Dict[str, Any]
     description: Optional[str] = None
-    input: Optional[str] = None
+    condition: str = "always"
     output: Optional[str] = None
     retry: Optional[int] = None
     timeout: Optional[int] = None
     on_error: Optional[str] = None
 
-    # Tool-specific fields
-    sql: Optional[str] = None
-    command: Optional[str] = None
-    script: Optional[str] = None
-    method: Optional[str] = None
-    url: Optional[str] = None
-    body: Optional[str] = None
-    prompt: Optional[Prompt] = None
-
     def variables(self) -> List[str]:
-        collected = []
-        for value in (
-            self.description,
-            self.input,
-            self.output,
-            self.sql,
-            self.command,
-            self.script,
-            self.url,
-            self.body,
-        ):
-            if value:
-                collected.extend(MarkdownParser.parse_variable(value))
-        if self.prompt:
-            collected.extend(self.prompt.variables())
-        return sorted(set(collected))
+        encoded = json.dumps(self.parameters, ensure_ascii=False)
+        return MarkdownParser.parse_variable(encoded)
 
 
 @dataclass
 class Workflow:
-    """Ability-level workflow object."""
+    """A diagnosis Ability."""
 
     ability: str
     name: str
     description: str
+    keywords: List[str]
+    external_parameters: List[ExternalParameter]
+    steps: List[Step]
     version: Optional[str] = None
-    trigger: List[str] = field(default_factory=list)
-    author: Optional[str] = None
-    tags: List[str] = field(default_factory=list)
-    steps: List[Step] = field(default_factory=list)
 
     def validate(self) -> None:
-        if not self.ability:
-            raise ValueError("Ability is required")
         if not self.name:
             raise ValueError(f"Ability '{self.ability}' missing required field: Name")
         if not self.description:
-            raise ValueError(f"Ability '{self.ability}' missing required field: Description")
+            raise ValueError(
+                f"Ability '{self.ability}' missing required field: Description"
+            )
+        if not self.keywords:
+            raise ValueError(f"Ability '{self.ability}' must define Keywords")
         if not self.steps:
             raise ValueError(f"Ability '{self.ability}' must contain at least one Step")
 
 
 class MarkdownParser:
-    """Parser that converts diagnosis markdown text to workflow objects."""
+    """Parse Markdown and produce directly executable, ordered request payloads."""
 
-    SUPPORTED_TOOLS = {"llm", "sql", "shell", "python", "http", "function"}
-    SUPPORTED_ON_ERROR = {"stop", "continue", "retry", "fallback"}
+    SUPPORTED_TOOL_TYPES = {"orchestration", "operation"}
+    SUPPORTED_ON_ERROR = {"stop", "continue", "retry"}
+    RESERVED_REQUEST_FIELDS = {"toolType", "TargetName"}
 
     def parse(self, markdown: str) -> List[Workflow]:
-        """Parse markdown text into a list of workflows."""
-        lines = markdown.splitlines()
-        workflows: List[Workflow] = []
-        ability_blocks = self._split_ability_blocks(lines)
-        for block in ability_blocks:
-            workflow = self.parse_ability(block)
+        workflows = [
+            self.parse_ability(block)
+            for block in self._split_ability_blocks(markdown.splitlines())
+        ]
+        for workflow in workflows:
             workflow.validate()
-            workflows.append(workflow)
         return workflows
 
-    def parse_ability(self, ability_lines: List[str]) -> Workflow:
-        """Parse one ability block."""
-        if not ability_lines:
-            raise ValueError("Ability block is empty")
+    def parse_ability(self, lines: List[str]) -> Workflow:
+        match = ABILITY_HEADER_PATTERN.match(lines[0].strip())
+        if not match:
+            raise ValueError(f"Invalid Ability header: {lines[0]}")
 
-        header_match = ABILITY_HEADER_PATTERN.match(ability_lines[0].strip())
-        if not header_match:
-            raise ValueError(f"Invalid ability header: {ability_lines[0]}")
-        ability = header_match.group("ability")
-
-        metadata, step_blocks = self._split_ability_metadata_and_steps(ability_lines[1:])
-        meta = self._parse_key_values(metadata)
-
-        name = meta.get("Name", "").strip()
-        description = meta.get("Description", "").strip()
-        version = self._optional_value(meta, "Version")
-        trigger = self._parse_list_field(meta, "Trigger")
-        author = self._optional_value(meta, "Author")
-        tags = self._parse_list_field(meta, "Tags")
-
-        steps = [self.parse_step(block) for block in step_blocks]
-        return Workflow(
-            ability=ability,
-            name=name,
-            description=description,
-            version=version,
-            trigger=trigger,
-            author=author,
-            tags=tags,
-            steps=steps,
+        metadata_lines, step_blocks = self._split_metadata_and_steps(lines[1:])
+        fields = self._parse_key_values(metadata_lines)
+        workflow = Workflow(
+            ability=match.group("name"),
+            name=self._required(fields, "Name", "Ability"),
+            description=self._required(fields, "Description", "Ability"),
+            keywords=self._parse_list(fields.get("Keywords", "")),
+            external_parameters=self.parse_external_parameters(
+                fields.get("ExternalParameters", "[]")
+            ),
+            version=self._optional(fields, "Version"),
+            steps=[self.parse_step(block) for block in step_blocks],
         )
+        return workflow
 
-    def parse_step(self, step_lines: List[str]) -> Step:
-        """Parse one step block."""
-        if not step_lines:
-            raise ValueError("Step block is empty")
+    def parse_step(self, lines: List[str]) -> Step:
+        match = STEP_HEADER_PATTERN.match(lines[0].strip())
+        if not match:
+            raise ValueError(f"Invalid Step header: {lines[0]}")
 
-        header_match = STEP_HEADER_PATTERN.match(step_lines[0].strip())
-        if not header_match:
-            raise ValueError(f"Invalid step header: {step_lines[0]}")
-        step_id = header_match.group("step_id")
+        step_id = match.group("name")
+        fields = self._parse_key_values(lines[1:])
+        tool_type = self._required(fields, "ToolType", step_id).lower()
+        if tool_type not in self.SUPPORTED_TOOL_TYPES:
+            raise ValueError(
+                f"{step_id} ToolType must be orchestration or operation, got: "
+                f"{tool_type}"
+            )
 
-        body_fields = self._parse_key_values(step_lines[1:])
-        name = self._required_field(body_fields, "Name", f"Step '{step_id}'")
-        tool = self._required_field(body_fields, "Tool", f"Step '{step_id}'").lower()
-        if tool not in self.SUPPORTED_TOOLS:
-            raise ValueError(f"Step '{step_id}' uses unsupported tool: {tool}")
+        parameters = self.parse_parameters(fields.get("Parameters", "{}"), step_id)
+        reserved = self.RESERVED_REQUEST_FIELDS.intersection(parameters)
+        if reserved:
+            raise ValueError(
+                f"{step_id} Parameters contains reserved fields: {sorted(reserved)}"
+            )
 
-        retry = self._parse_optional_int(body_fields.get("Retry"), "Retry", step_id)
-        timeout = self._parse_optional_int(body_fields.get("Timeout"), "Timeout", step_id)
-        on_error = self._optional_value(body_fields, "OnError")
+        on_error = self._optional(fields, "OnError")
         if on_error and on_error not in self.SUPPORTED_ON_ERROR:
-            raise ValueError(f"Step '{step_id}' has invalid OnError value: {on_error}")
+            raise ValueError(f"{step_id} has invalid OnError value: {on_error}")
 
-        step = Step(
+        return Step(
             id=step_id,
-            name=name,
-            tool=tool,
-            description=self._optional_value(body_fields, "Description"),
-            input=self._optional_value(body_fields, "Input"),
-            output=self._optional_value(body_fields, "Output"),
-            retry=retry,
-            timeout=timeout,
+            name=self._required(fields, "Name", step_id),
+            tool_type=tool_type,
+            target_name=self._required(fields, "TargetName", step_id),
+            parameters=parameters,
+            description=self._optional(fields, "Description"),
+            condition=self._optional(fields, "Condition") or "always",
+            output=self._optional(fields, "Output"),
+            retry=self._optional_int(fields.get("Retry"), "Retry", step_id),
+            timeout=self._optional_int(fields.get("Timeout"), "Timeout", step_id),
             on_error=on_error,
-            sql=self._optional_value(body_fields, "SQL"),
-            command=self._optional_value(body_fields, "Command"),
-            script=self._optional_value(body_fields, "Script"),
-            method=self._optional_value(body_fields, "Method"),
-            url=self._optional_value(body_fields, "Url"),
-            body=self._optional_value(body_fields, "Body"),
         )
 
-        if tool == "llm":
-            step.prompt = self.parse_prompt(body_fields)
-        return step
+    def parse_external_parameters(self, value: str) -> List[ExternalParameter]:
+        data = self._parse_json_block(value, "ExternalParameters")
+        if not isinstance(data, list):
+            raise ValueError("ExternalParameters must be a JSON array")
 
-    def parse_prompt(self, fields: Dict[str, str]) -> Prompt:
-        """Parse llm prompt fields from a step."""
-        return Prompt(
-            system=self._optional_value(fields, "System"),
-            user=self._optional_value(fields, "User"),
-            input=self._optional_value(fields, "Input"),
-        )
+        parameters: List[ExternalParameter] = []
+        for item in data:
+            if not isinstance(item, dict) or not item.get("name"):
+                raise ValueError(
+                    "Each ExternalParameters item must be an object with a name"
+                )
+            parameters.append(
+                ExternalParameter(
+                    name=item["name"],
+                    type=item.get("type", "string"),
+                    required=bool(item.get("required", False)),
+                    default=item.get("default"),
+                    aliases=list(item.get("aliases", [])),
+                    description=item.get("description", ""),
+                    secret=bool(item.get("secret", False)),
+                )
+            )
+        return parameters
+
+    def parse_parameters(self, value: str, step_id: str = "Step") -> Dict[str, Any]:
+        data = self._parse_json_block(value, f"{step_id} Parameters")
+        if not isinstance(data, dict):
+            raise ValueError(f"{step_id} Parameters must be a JSON object")
+        return data
+
+    def build_execution_plan(
+        self,
+        markdown: str,
+        user_input: str,
+        external_parameters: Mapping[str, Any],
+        ability_name: Optional[str] = None,
+        step_results: Optional[Mapping[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Build ordered, flat requests for the local automation platform.
+
+        External values are assigned immediately. References to previous Step results
+        are assigned when ``step_results`` contains them; otherwise their template is
+        retained so a sequential executor can resolve it after that Step finishes.
+        """
+        workflows = self.parse(markdown)
+        workflow = self.select_ability(workflows, user_input, ability_name)
+        external = self.bind_external_parameters(workflow, external_parameters)
+        context = {
+            "external": external,
+            "user_input": user_input,
+            "steps": dict(step_results or {}),
+        }
+
+        plan: List[Dict[str, Any]] = []
+        for step in workflow.steps:
+            request: Dict[str, Any] = {
+                "toolType": step.tool_type,
+                "TargetName": step.target_name,
+            }
+            request.update(self._resolve_value(step.parameters, context))
+            plan.append(request)
+        return plan
+
+    def select_ability(
+        self,
+        workflows: List[Workflow],
+        user_input: str,
+        ability_name: Optional[str] = None,
+    ) -> Workflow:
+        if ability_name:
+            for workflow in workflows:
+                if workflow.ability == ability_name:
+                    return workflow
+            raise ValueError(f"Ability not found: {ability_name}")
+
+        normalized = user_input.casefold()
+        matches = [
+            workflow
+            for workflow in workflows
+            if any(keyword.casefold() in normalized for keyword in workflow.keywords)
+        ]
+        if not matches:
+            raise ValueError("No Ability matched the user input")
+        if len(matches) > 1:
+            names = ", ".join(workflow.ability for workflow in matches)
+            raise ValueError(f"Multiple Abilities matched; specify ability_name: {names}")
+        return matches[0]
+
+    def bind_external_parameters(
+        self, workflow: Workflow, supplied: Mapping[str, Any]
+    ) -> Dict[str, Any]:
+        """Normalize canonical names/aliases and validate required external values."""
+        bound: Dict[str, Any] = {}
+        missing: List[str] = []
+        for definition in workflow.external_parameters:
+            candidates = [definition.name, *definition.aliases]
+            found = next((name for name in candidates if name in supplied), None)
+            if found is not None:
+                bound[definition.name] = supplied[found]
+            elif definition.default is not None:
+                bound[definition.name] = definition.default
+            elif definition.required:
+                missing.append(definition.name)
+            else:
+                bound[definition.name] = None
+
+        if missing:
+            raise ValueError(
+                "Missing required external parameters: " + ", ".join(missing)
+            )
+        return bound
 
     @staticmethod
     def parse_variable(text: str) -> List[str]:
-        """Extract '{{variable}}' references from text."""
-        return [m.group(1).strip() for m in VARIABLE_PATTERN.finditer(text or "")]
+        return [match.group(1).strip() for match in VARIABLE_PATTERN.finditer(text)]
+
+    def _resolve_value(self, value: Any, context: Mapping[str, Any]) -> Any:
+        if isinstance(value, dict):
+            return {key: self._resolve_value(item, context) for key, item in value.items()}
+        if isinstance(value, list):
+            return [self._resolve_value(item, context) for item in value]
+        if not isinstance(value, str):
+            return value
+
+        full_match = VARIABLE_PATTERN.fullmatch(value)
+        if full_match:
+            found, resolved = self._lookup(full_match.group(1).strip(), context)
+            return resolved if found else value
+
+        def replacement(match: re.Match[str]) -> str:
+            found, resolved = self._lookup(match.group(1).strip(), context)
+            return str(resolved) if found else match.group(0)
+
+        return VARIABLE_PATTERN.sub(replacement, value)
+
+    def _lookup(
+        self, expression: str, context: Mapping[str, Any]
+    ) -> Tuple[bool, Any]:
+        if expression == "user_input":
+            return True, context["user_input"]
+
+        parts = expression.split(".")
+        current: Any = context
+        for part in parts:
+            if isinstance(current, Mapping) and part in current:
+                current = current[part]
+            else:
+                return False, None
+        return True, current
 
     def _split_ability_blocks(self, lines: List[str]) -> List[List[str]]:
         blocks: List[List[str]] = []
@@ -216,109 +305,89 @@ class MarkdownParser:
                 if current:
                     blocks.append(current)
                 current = [line]
-                continue
-            if current:
+            elif current:
                 current.append(line)
         if current:
             blocks.append(current)
         return blocks
 
-    def _split_ability_metadata_and_steps(
+    def _split_metadata_and_steps(
         self, lines: List[str]
     ) -> Tuple[List[str], List[List[str]]]:
         metadata: List[str] = []
-        step_blocks: List[List[str]] = []
-        current_step: List[str] = []
-
+        steps: List[List[str]] = []
+        current: List[str] = []
         for line in lines:
             if STEP_HEADER_PATTERN.match(line.strip()):
-                if current_step:
-                    step_blocks.append(current_step)
-                current_step = [line]
-                continue
-
-            if current_step:
-                current_step.append(line)
+                if current:
+                    steps.append(current)
+                current = [line]
+            elif current:
+                current.append(line)
             else:
                 metadata.append(line)
-
-        if current_step:
-            step_blocks.append(current_step)
-        return metadata, step_blocks
+        if current:
+            steps.append(current)
+        return metadata, steps
 
     def _parse_key_values(self, lines: List[str]) -> Dict[str, str]:
         fields: Dict[str, str] = {}
-        current_key: Optional[str] = None
+        key: Optional[str] = None
         buffer: List[str] = []
 
         def flush() -> None:
-            nonlocal current_key, buffer
-            if current_key is not None:
-                fields[current_key] = "\n".join(buffer).strip()
-            current_key = None
-            buffer = []
+            nonlocal key, buffer
+            if key is not None:
+                fields[key] = "\n".join(buffer).strip()
+            key, buffer = None, []
 
         for raw in lines:
             line = raw.rstrip()
-            if not line.strip():
-                if current_key is not None:
-                    buffer.append("")
+            if line.strip() == "---":
                 continue
-
-            if re.match(r"^[A-Za-z][A-Za-z0-9_]*\s*:", line):
+            match = re.match(r"^([A-Za-z][A-Za-z0-9_]*)\s*:\s*(.*)$", line)
+            if match:
                 flush()
-                key, value = line.split(":", 1)
-                current_key = key.strip()
-                value_text = value.lstrip()
-                if value_text:
-                    buffer = [value_text]
-                else:
-                    buffer = []
-                continue
-
-            if current_key is not None:
+                key = match.group(1)
+                buffer = [match.group(2)] if match.group(2) else []
+            elif key is not None:
                 buffer.append(line)
-
         flush()
         return fields
 
-    def _optional_value(self, fields: Dict[str, str], key: str) -> Optional[str]:
-        value = fields.get(key)
-        if value is None:
-            return None
-        stripped = value.strip()
-        return stripped if stripped else None
+    def _parse_json_block(self, value: str, field_name: str) -> Any:
+        text = value.strip()
+        fence = re.fullmatch(r"```(?:json)?\s*\n?(.*?)\n?```", text, re.DOTALL)
+        if fence:
+            text = fence.group(1).strip()
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{field_name} contains invalid JSON: {exc.msg}") from exc
 
-    def _required_field(self, fields: Dict[str, str], key: str, scope: str) -> str:
-        value = self._optional_value(fields, key)
+    def _parse_list(self, value: str) -> List[str]:
+        return [
+            line.strip()[1:].strip()
+            for line in value.splitlines()
+            if line.strip().startswith("-") and line.strip()[1:].strip()
+        ]
+
+    def _required(self, fields: Dict[str, str], key: str, scope: str) -> str:
+        value = self._optional(fields, key)
         if not value:
             raise ValueError(f"{scope} missing required field: {key}")
         return value
 
-    def _parse_optional_int(
-        self, value: Optional[str], key_name: str, step_id: str
+    def _optional(self, fields: Dict[str, str], key: str) -> Optional[str]:
+        value = fields.get(key, "").strip()
+        return value or None
+
+    def _optional_int(
+        self, value: Optional[str], field_name: str, scope: str
     ) -> Optional[int]:
-        if value is None or not value.strip():
+        if not value:
             return None
         try:
             return int(value.strip())
         except ValueError as exc:
-            raise ValueError(
-                f"Step '{step_id}' has invalid integer for {key_name}: {value}"
-            ) from exc
-
-    def _parse_list_field(self, fields: Dict[str, str], key: str) -> List[str]:
-        raw = fields.get(key, "")
-        if not raw.strip():
-            return []
-        values: List[str] = []
-        for line in raw.splitlines():
-            striped = line.strip()
-            if striped.startswith("-"):
-                item = striped[1:].strip()
-                if item:
-                    values.append(item)
-            elif striped:
-                # Also allow single-line values without bullets.
-                values.append(striped)
-        return values
+            raise ValueError(f"{scope} has invalid {field_name}: {value}") from exc
