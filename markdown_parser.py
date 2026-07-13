@@ -78,6 +78,8 @@ class MarkdownParser:
     SUPPORTED_TOOL_TYPES = {"orchestration", "operation"}
     SUPPORTED_ON_ERROR = {"stop", "continue", "retry"}
     RESERVED_REQUEST_FIELDS = {"toolType", "TargetName"}
+    BOOLEAN_TRUE_VALUES = {"true", "yes", "1", "是", "允许"}
+    BOOLEAN_FALSE_VALUES = {"false", "no", "0", "否", "不允许"}
 
     def parse(self, markdown: str) -> List[Workflow]:
         workflows = [
@@ -120,23 +122,10 @@ class MarkdownParser:
 
         step_id = match.group("name")
         fields = self._parse_key_values(lines[1:])
-        tool_type = self._required(fields, "ToolType", step_id).lower()
-        if tool_type not in self.SUPPORTED_TOOL_TYPES:
-            raise ValueError(
-                f"{step_id} ToolType must be orchestration or operation, got: "
-                f"{tool_type}"
-            )
-
+        tool_type = self._parse_tool_type(fields, step_id)
         parameters = self.parse_parameters(fields.get("Parameters", "{}"), step_id)
-        reserved = self.RESERVED_REQUEST_FIELDS.intersection(parameters)
-        if reserved:
-            raise ValueError(
-                f"{step_id} Parameters contains reserved fields: {sorted(reserved)}"
-            )
-
-        on_error = self._optional(fields, "OnError")
-        if on_error and on_error not in self.SUPPORTED_ON_ERROR:
-            raise ValueError(f"{step_id} has invalid OnError value: {on_error}")
+        self._validate_reserved_parameters(step_id, parameters)
+        on_error = self._parse_on_error(fields, step_id)
 
         return Step(
             id=step_id,
@@ -262,26 +251,32 @@ class MarkdownParser:
         bound: Dict[str, Any] = {}
         missing: List[str] = []
         for definition in workflow.external_parameters:
-            candidates = [definition.name, *definition.aliases]
-            found = next((name for name in candidates if name in supplied), None)
-            if found is not None:
-                bound[definition.name] = self._coerce_parameter(
-                    supplied[found], definition
-                )
-            elif definition.default is not None:
-                bound[definition.name] = self._coerce_parameter(
-                    definition.default, definition
-                )
-            elif definition.required:
+            value, is_missing = self._bind_one_external_parameter(definition, supplied)
+            if is_missing:
                 missing.append(definition.name)
             else:
-                bound[definition.name] = None
+                bound[definition.name] = value
 
         if missing:
             raise ValueError(
                 "Missing required external parameters: " + ", ".join(missing)
             )
         return bound
+
+    def _bind_one_external_parameter(
+        self,
+        definition: ExternalParameter,
+        supplied: Mapping[str, Any],
+    ) -> Tuple[Any, bool]:
+        for key in [definition.name, *definition.aliases]:
+            if key in supplied:
+                return self._coerce_parameter(supplied[key], definition), False
+
+        if definition.default is not None:
+            return self._coerce_parameter(definition.default, definition), False
+        if definition.required:
+            return None, True
+        return None, False
 
     def _coerce_parameter(
         self, value: Any, definition: ExternalParameter
@@ -294,41 +289,9 @@ class MarkdownParser:
             return None
 
         expected = definition.type.lower()
+        coercer = self._coercer_for(expected, definition)
         try:
-            if expected == "string":
-                if isinstance(value, (dict, list)):
-                    raise TypeError
-                return str(value)
-            if expected == "integer":
-                if isinstance(value, bool):
-                    raise TypeError
-                return int(value)
-            if expected == "number":
-                if isinstance(value, bool):
-                    raise TypeError
-                return float(value)
-            if expected == "boolean":
-                if isinstance(value, bool):
-                    return value
-                if isinstance(value, str):
-                    normalized = value.strip().lower()
-                    if normalized in {"true", "yes", "1", "是", "允许"}:
-                        return True
-                    if normalized in {"false", "no", "0", "否", "不允许"}:
-                        return False
-                if value in (0, 1):
-                    return bool(value)
-                raise TypeError
-            if expected == "object" and isinstance(value, Mapping):
-                return dict(value)
-            if expected == "array" and isinstance(value, list):
-                return value
-            if expected not in {"object", "array"}:
-                raise ValueError(
-                    f"Unsupported type '{definition.type}' for "
-                    f"external parameter '{definition.name}'"
-                )
-            raise TypeError
+            return coercer(value)
         except (TypeError, ValueError) as exc:
             if isinstance(exc, ValueError) and str(exc).startswith("Unsupported type"):
                 raise
@@ -337,13 +300,70 @@ class MarkdownParser:
                 f"{definition.type}, got {value!r}"
             ) from exc
 
+    def _coercer_for(self, expected: str, definition: ExternalParameter):
+        coercers = {
+            "string": self._coerce_string,
+            "integer": self._coerce_integer,
+            "number": self._coerce_number,
+            "boolean": self._coerce_boolean,
+            "object": self._coerce_object,
+            "array": self._coerce_array,
+        }
+        if expected not in coercers:
+            raise ValueError(
+                f"Unsupported type '{definition.type}' for "
+                f"external parameter '{definition.name}'"
+            )
+        return coercers[expected]
+
+    def _coerce_string(self, value: Any) -> str:
+        if isinstance(value, (dict, list)):
+            raise TypeError
+        return str(value)
+
+    def _coerce_integer(self, value: Any) -> int:
+        if isinstance(value, bool):
+            raise TypeError
+        return int(value)
+
+    def _coerce_number(self, value: Any) -> float:
+        if isinstance(value, bool):
+            raise TypeError
+        return float(value)
+
+    def _coerce_boolean(self, value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in self.BOOLEAN_TRUE_VALUES:
+                return True
+            if normalized in self.BOOLEAN_FALSE_VALUES:
+                return False
+        if value in (0, 1):
+            return bool(value)
+        raise TypeError
+
+    def _coerce_object(self, value: Any) -> Dict[str, Any]:
+        if not isinstance(value, Mapping):
+            raise TypeError
+        return dict(value)
+
+    def _coerce_array(self, value: Any) -> List[Any]:
+        if not isinstance(value, list):
+            raise TypeError
+        return value
+
     @staticmethod
     def parse_variable(text: str) -> List[str]:
         return [match.group(1).strip() for match in VARIABLE_PATTERN.finditer(text)]
 
     def _resolve_value(self, value: Any, context: Mapping[str, Any]) -> Any:
         if isinstance(value, dict):
-            return {key: self._resolve_value(item, context) for key, item in value.items()}
+            return {
+                key: self._resolve_value(item, context)
+                for key, item in value.items()
+            }
         if isinstance(value, list):
             return [self._resolve_value(item, context) for item in value]
         if not isinstance(value, str):
@@ -359,6 +379,30 @@ class MarkdownParser:
             return str(resolved) if found else match.group(0)
 
         return VARIABLE_PATTERN.sub(replacement, value)
+
+    def _parse_tool_type(self, fields: Dict[str, str], step_id: str) -> str:
+        tool_type = self._required(fields, "ToolType", step_id).lower()
+        if tool_type not in self.SUPPORTED_TOOL_TYPES:
+            raise ValueError(
+                f"{step_id} ToolType must be orchestration or operation, got: "
+                f"{tool_type}"
+            )
+        return tool_type
+
+    def _validate_reserved_parameters(
+        self, step_id: str, parameters: Mapping[str, Any]
+    ) -> None:
+        reserved = self.RESERVED_REQUEST_FIELDS.intersection(parameters)
+        if reserved:
+            raise ValueError(
+                f"{step_id} Parameters contains reserved fields: {sorted(reserved)}"
+            )
+
+    def _parse_on_error(self, fields: Dict[str, str], step_id: str) -> Optional[str]:
+        on_error = self._optional(fields, "OnError")
+        if on_error and on_error not in self.SUPPORTED_ON_ERROR:
+            raise ValueError(f"{step_id} has invalid OnError value: {on_error}")
+        return on_error
 
     def _lookup(
         self, expression: str, context: Mapping[str, Any]
