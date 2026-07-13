@@ -30,3 +30,13 @@ python3 run_diagnosis.py \
 ```bash
 python3 -m unittest -v
 ```
+
+## Groovy Markdown 解析脚本（无正则）
+
+新增 `complex_md_parser.groovy`，用于解析复杂 Markdown（标题层级、键值块、多行字段、列表、JSON 代码块），并输出结构化 JSON。
+
+```bash
+groovy complex_md_parser.groovy diagnosis.md
+```
+
+脚本实现约束：不使用正则表达式 API（如 `Pattern`、`matches`、`replaceAll`）。
