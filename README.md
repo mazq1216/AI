@@ -40,3 +40,24 @@ groovy complex_md_parser.groovy diagnosis.md
 ```
 
 脚本实现约束：不使用正则表达式 API（如 `Pattern`、`matches`、`replaceAll`）。
+
+## Markdown 转 HTML5（Groovy 2.5.6，分词+AST，无正则）
+
+新增 `markdown_html5_converter.groovy`：
+
+- 使用“分词（lexer）+ AST + 渲染器”实现 Markdown 到 HTML5 的转换。
+- 不使用正则表达式。
+- 支持源文本里包含字面量 `\n`（会先解码再解析）。
+- 支持常见 Markdown 结构：标题、段落、无序/有序列表、引用、围栏代码块、分隔线、表格、行内强调/代码/链接/图片/删除线。
+
+运行：
+
+```bash
+groovy markdown_html5_converter.groovy
+```
+
+或指定文件：
+
+```bash
+groovy markdown_html5_converter.groovy your.md
+```
