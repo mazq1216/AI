@@ -359,25 +359,83 @@ class MarkdownParser:
         return [match.group(1).strip() for match in VARIABLE_PATTERN.finditer(text)]
 
     def _resolve_value(self, value: Any, context: Mapping[str, Any]) -> Any:
+        """把参数模板中的 {{变量}} 替换成 context 里的真实值。
+
+        支持递归解析：
+        - dict：对每个 value 再调用本函数
+        - list：对每个元素再调用本函数
+        - 普通值/字符串：在本层直接处理
+
+        例如输入：
+            {
+              "db_ip": "{{external.db_ip}}",
+              "tags": ["{{external.db_name}}", "lock"]
+            }
+        会先进入 dict 分支，再对每个字段递归；遇到 list 再继续递归，
+        最终把所有可解析变量替换成真实值。
+        """
+        # ---------- 递归分支 1：字典 ----------
+        # 如果当前值是 dict，说明这是一个参数对象（例如 Step.Parameters）。
+        # 字典本身不直接替换，而是对每个 value 再调用 _resolve_value。
+        # key 保持不变，只解析 value。
+        #
+        # 递归示意：
+        #   {"a": "{{x}}", "b": {"c": "{{y}}"}}
+        #     -> 解析 a: "{{x}}"
+        #     -> 解析 b: 又是 dict，继续递归解析 c: "{{y}}"
         if isinstance(value, dict):
             return {
+                # key：参数名，原样保留
+                # item：参数模板值，可能还是 dict/list/str，因此递归调用
                 key: self._resolve_value(item, context)
                 for key, item in value.items()
             }
+
+        # ---------- 递归分支 2：列表 ----------
+        # 如果当前值是 list，说明这是数组型参数。
+        # 对每个元素递归解析，保证嵌套模板也能被替换。
+        #
+        # 递归示意：
+        #   ["{{external.db_ip}}", {"name": "{{external.db_name}}"}]
+        #     -> 第 1 个元素是字符串，走字符串替换
+        #     -> 第 2 个元素是 dict，再进入上面的 dict 递归分支
         if isinstance(value, list):
             return [self._resolve_value(item, context) for item in value]
+
+        # ---------- 终止条件：非字符串叶子节点 ----------
+        # 走到这里说明既不是 dict，也不是 list。
+        # 若也不是字符串（如 int/bool/None），说明已经是最终值，无需替换，直接返回。
+        # 这是递归的重要出口之一，避免无意义继续下钻。
         if not isinstance(value, str):
             return value
 
+        # ---------- 字符串叶子节点：做变量替换 ----------
+        # 从这里开始处理字符串模板，不再递归结构，而是解析 {{...}}。
+
+        # 情况 A：整个字符串恰好是一个变量，例如 "{{external.db_port}}"
+        # 使用 fullmatch，要求从头到尾完全匹配，不能有额外文字。
         full_match = VARIABLE_PATTERN.fullmatch(value)
         if full_match:
+            # group(1) 取出花括号内表达式，如 "external.db_port"
+            # strip() 去掉表达式两侧空格，兼容 "{{ external.db_port }}"
+            # _lookup 在 context 中按路径查找对应值
             found, resolved = self._lookup(full_match.group(1).strip(), context)
+            # 找到则返回原类型值（可能是 int/dict/list），实现“类型保留”
+            # 找不到则返回原模板字符串，留给后续步骤结果就绪后再解析
             return resolved if found else value
 
+        # 情况 B：字符串中嵌入一个或多个变量，例如
+        # "处理问题：{{user_input}}，库名={{external.db_name}}"
+        # 这时不能整段替换为对象，只能把每个变量转成字符串后拼回去。
         def replacement(match: re.Match[str]) -> str:
+            # match.group(1) 是当前匹配到的变量表达式
             found, resolved = self._lookup(match.group(1).strip(), context)
+            # 找到：转成字符串后参与拼接
+            # 找不到：保留原始 "{{...}}" 文本，避免静默丢信息
             return str(resolved) if found else match.group(0)
 
+        # sub 会扫描字符串中所有 {{...}}，并对每个匹配调用 replacement。
+        # 最终返回完成变量替换后的字符串。
         return VARIABLE_PATTERN.sub(replacement, value)
 
     def _parse_tool_type(self, fields: Dict[str, str], step_id: str) -> str:
