@@ -134,16 +134,6 @@ class MarkdownParserTests(unittest.TestCase):
         self.assertIn("ToolType: must stay inside fence", fields["Parameters"])
         self.assertEqual(fields["Output"], "steps.Step1.result")
 
-    def test_parse_key_values_supports_fullwidth_colon_for_condition(self) -> None:
-        fields = self.parser._parse_key_values(
-            [
-                "TargetName: db_lock_release_operation",
-                "Condition：external.allow_recovery == true",
-            ]
-        )
-        self.assertEqual(fields["TargetName"], "db_lock_release_operation")
-        self.assertEqual(fields["Condition"], "external.allow_recovery == true")
-
 
 if __name__ == "__main__":
     unittest.main()

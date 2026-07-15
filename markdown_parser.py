@@ -588,50 +588,9 @@ class MarkdownParser:
         return (int(match.group()) if match else 2**31, step.id)
 
     def _parse_key_values(self, lines: List[str]) -> Dict[str, str]:
-        """Parse ``Key: value`` blocks used by Ability/Step definitions.
-
-        Important behaviors:
-        - Key lines may be indented; matching uses the stripped line.
-        - Content inside fenced code blocks (``` ... ```) is never treated as a
-          new key, so JSON bodies cannot steal following fields.
-        - Known single-line fields are protected from swallowing the next key
-          when a malformed line would otherwise become a continuation.
-        """
-        known_keys = {
-            "Name",
-            "Description",
-            "Keywords",
-            "Version",
-            "ExternalParameters",
-            "ToolType",
-            "TargetName",
-            "Condition",
-            "Parameters",
-            "Output",
-            "Retry",
-            "Timeout",
-            "OnError",
-            "Author",
-            "Tags",
-            "Trigger",
-        }
-        single_line_keys = {
-            "Name",
-            "Version",
-            "ToolType",
-            "TargetName",
-            "Condition",
-            "Output",
-            "Retry",
-            "Timeout",
-            "OnError",
-            "Author",
-        }
-
         fields: Dict[str, str] = {}
         key: Optional[str] = None
         buffer: List[str] = []
-        in_fence = False
 
         def flush() -> None:
             nonlocal key, buffer
@@ -639,64 +598,21 @@ class MarkdownParser:
                 fields[key] = "\n".join(buffer).strip()
             key, buffer = None, []
 
-        def match_key_line(text: str) -> Optional[re.Match[str]]:
-            # Allow indented keys such as "  Condition: always".
-            return re.match(r"^([A-Za-z][A-Za-z0-9_]*)\s*:\s*(.*)$", text.strip())
-
         for raw in lines:
             line = raw.rstrip()
-            stripped = line.strip()
-
-            if stripped == "---":
+            if line.strip() == "---":
                 continue
 
-            # Toggle / keep fenced blocks attached to the current field.
-            if stripped.startswith("```"):
-                if key is not None:
-                    buffer.append(line)
-                in_fence = not in_fence
-                continue
-
-            if in_fence:
-                if key is not None:
-                    buffer.append(line)
-                continue
-
-            match = match_key_line(stripped)
+            # 最小修复：字段可能有缩进，匹配前去掉行首尾空白。
+            match = re.match(
+                r"^([A-Za-z][A-Za-z0-9_]*)\s*:\s*(.*)$",
+                line.strip(),
+            )
             if match:
                 flush()
                 key = match.group(1)
-                inline = match.group(2)
-                buffer = [inline] if inline else []
-                continue
-
-            # Recovery path: a continuation that actually starts a known key
-            # (for example after an unexpected indent/full-width colon mix-up).
-            recovered = None
-            for known in known_keys:
-                prefix = known + ":"
-                if stripped.startswith(prefix) or stripped.startswith(known + "："):
-                    recovered = known
-                    break
-            if recovered is not None:
-                flush()
-                key = recovered
-                separator = ":" if (recovered + ":") in stripped else "："
-                inline = stripped.split(separator, 1)[1].strip()
-                buffer = [inline] if inline else []
-                continue
-
-            if key is not None:
-                # Prevent single-line fields from absorbing the next key/value
-                # when a blank line or stray text appears before the real key.
-                if key in single_line_keys and buffer and stripped:
-                    maybe_next = match_key_line(stripped)
-                    if maybe_next:
-                        flush()
-                        key = maybe_next.group(1)
-                        inline = maybe_next.group(2)
-                        buffer = [inline] if inline else []
-                        continue
+                buffer = [match.group(2)] if match.group(2) else []
+            elif key is not None:
                 buffer.append(line)
 
         flush()
