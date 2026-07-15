@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import argparse
 from dataclasses import dataclass, field
 import json
+from pathlib import Path
 import re
+import sys
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 
@@ -209,6 +212,76 @@ class MarkdownParser:
         }
         request.update(self._resolve_value(step.parameters, context))
         return request
+
+    def build_transfer_plan(
+        self,
+        markdown: str,
+        llm_result: Mapping[str, Any],
+        user_input: Optional[str] = None,
+        step_results: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Combine LLM result with Markdown into a transferable execution plan.
+
+        This is the hand-off payload for a separate platform executor script.
+        External parameters are bound immediately. References to later Step
+        results remain as ``{{steps...}}`` templates until those results exist.
+        """
+        ability_name = llm_result.get("ability")
+        if not isinstance(ability_name, str) or not ability_name.strip():
+            raise ValueError("LLM result must contain a non-empty ability")
+
+        external_raw = (
+            llm_result.get("external_parameters")
+            if "external_parameters" in llm_result
+            else llm_result.get("externalParameters")
+        )
+        if external_raw is None:
+            external_raw = {}
+        if not isinstance(external_raw, Mapping):
+            raise ValueError("LLM result external parameters must be an object")
+
+        question = user_input or llm_result.get("user_input")
+        if not isinstance(question, str) or not question.strip():
+            raise ValueError(
+                "user_input is required either via --question or LLM result JSON"
+            )
+
+        workflows = self.parse(markdown)
+        workflow = self.select_ability(
+            workflows, question, ability_name=ability_name.strip()
+        )
+        external = self.bind_external_parameters(workflow, external_raw)
+        context = {
+            "external": external,
+            "user_input": question,
+            "steps": dict(step_results or {}),
+        }
+
+        steps: List[Dict[str, Any]] = []
+        for step in workflow.steps:
+            resolved_parameters = self._resolve_value(step.parameters, context)
+            steps.append(
+                {
+                    "id": step.id,
+                    "name": step.name,
+                    "condition": step.condition,
+                    "retry": step.retry,
+                    "timeout": step.timeout,
+                    "on_error": step.on_error,
+                    "toolType": step.tool_type,
+                    "TargetName": step.target_name,
+                    "parameters": resolved_parameters,
+                    "request": self.build_step_request(step, context),
+                }
+            )
+
+        return {
+            "ability": workflow.ability,
+            "user_input": question,
+            "reasoning": llm_result.get("reasoning"),
+            "external_parameters": external,
+            "steps": steps,
+        }
 
     def select_ability(
         self,
@@ -575,3 +648,69 @@ class MarkdownParser:
             return int(value.strip())
         except ValueError as exc:
             raise ValueError(f"{scope} has invalid {field_name}: {value}") from exc
+
+
+def load_json_payload(source: str) -> Dict[str, Any]:
+    """Load JSON from a file path or stdin (``-``)."""
+    if source == "-":
+        text = sys.stdin.read()
+    else:
+        text = Path(source).read_text(encoding="utf-8")
+    data = json.loads(text)
+    if not isinstance(data, dict):
+        raise ValueError("JSON payload must be an object")
+    return data
+
+
+def write_json(payload: Mapping[str, Any], output: str) -> None:
+    text = json.dumps(payload, ensure_ascii=False, indent=2)
+    if output == "-":
+        print(text)
+        return
+    Path(output).write_text(text + "\n", encoding="utf-8")
+
+
+def build_argument_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Independently parse diagnosis Markdown using an LLM analyzer result"
+        )
+    )
+    parser.add_argument(
+        "--markdown",
+        default="diagnosis.md",
+        help="Path to diagnosis Markdown file",
+    )
+    parser.add_argument(
+        "--llm-result",
+        required=True,
+        help="JSON file produced by llm_analyzer.py, or '-' for stdin",
+    )
+    parser.add_argument(
+        "--question",
+        default=None,
+        help="Optional override for user_input; defaults to LLM result user_input",
+    )
+    parser.add_argument(
+        "--output",
+        default="-",
+        help="Where to write execution plan JSON: file path or '-' for stdout",
+    )
+    return parser
+
+
+def main(argv: Optional[List[str]] = None) -> None:
+    """CLI entry: consume LLM JSON + Markdown -> emit transferable plan JSON."""
+    args = build_argument_parser().parse_args(argv)
+    markdown = Path(args.markdown).read_text(encoding="utf-8")
+    llm_result = load_json_payload(args.llm_result)
+    plan = MarkdownParser().build_transfer_plan(
+        markdown,
+        llm_result,
+        user_input=args.question,
+    )
+    write_json(plan, args.output)
+
+
+if __name__ == "__main__":
+    main()

@@ -2,12 +2,45 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import argparse
+from dataclasses import asdict, dataclass
 import json
+import os
+from pathlib import Path
 import re
-from typing import Any, Dict, Mapping, Optional, Protocol
+from typing import Any, Dict, Mapping, Optional, Protocol, Union
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+
+
+def load_markdown(markdown_source: Union[str, Path]) -> str:
+    """Load Markdown file content into a string variable.
+
+    Parameters
+    ----------
+    markdown_source:
+        Path to a ``.md`` file, or Markdown text itself.
+
+    Returns
+    -------
+    str
+        Markdown content that can be passed to ``LLMAnalyzer.analyze``.
+    """
+    path = Path(markdown_source)
+    if path.is_file():
+        return path.read_text(encoding="utf-8")
+
+    text = str(markdown_source)
+    # If the caller passed a path-like string that does not exist, fail clearly.
+    looks_like_path = (
+        text.endswith(".md")
+        or "/" in text
+        or "\\" in text
+        or text.startswith(".")
+    )
+    if looks_like_path and "\n" not in text and len(text) < 512:
+        raise FileNotFoundError(f"Markdown file not found: {text}")
+    return text
 
 
 class ChatClient(Protocol):
@@ -148,3 +181,86 @@ class LLMAnalyzer:
         if not isinstance(data, dict):
             raise ValueError("LLM output must be a JSON object")
         return data
+
+
+def build_argument_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Independently run LLM Ability matching against a Markdown file"
+    )
+    parser.add_argument(
+        "--markdown",
+        default="diagnosis.md",
+        help="Path to diagnosis Markdown file (loaded into markdown variable)",
+    )
+    parser.add_argument(
+        "--question",
+        required=True,
+        help="User problem description used for Ability matching",
+    )
+    parser.add_argument(
+        "--output",
+        default="-",
+        help="Where to write LLM result JSON: file path or '-' for stdout",
+    )
+    parser.add_argument(
+        "--llm-endpoint",
+        default=os.getenv("LLM_ENDPOINT"),
+        help="OpenAI-compatible chat completions endpoint",
+    )
+    parser.add_argument(
+        "--llm-model",
+        default=os.getenv("LLM_MODEL"),
+        help="Model name for the LLM endpoint",
+    )
+    parser.add_argument(
+        "--llm-api-key",
+        default=os.getenv("LLM_API_KEY"),
+        help="Optional API key; falls back to LLM_API_KEY",
+    )
+    return parser
+
+
+def write_json(payload: Mapping[str, Any], output: str) -> None:
+    text = json.dumps(payload, ensure_ascii=False, indent=2)
+    if output == "-":
+        print(text)
+        return
+    Path(output).write_text(text + "\n", encoding="utf-8")
+
+
+def main(argv: Optional[list[str]] = None) -> None:
+    """CLI entry: load Markdown file -> analyze with LLM -> emit transferable JSON."""
+    args = build_argument_parser().parse_args(argv)
+    missing = [
+        name
+        for name, value in (
+            ("--llm-endpoint/LLM_ENDPOINT", args.llm_endpoint),
+            ("--llm-model/LLM_MODEL", args.llm_model),
+        )
+        if not value
+    ]
+    if missing:
+        raise SystemExit("Missing configuration: " + ", ".join(missing))
+
+    # Convert Markdown file path into the markdown string variable used by analyze().
+    markdown = load_markdown(args.markdown)
+
+    analyzer = LLMAnalyzer(
+        OpenAICompatibleChatClient(
+            endpoint=args.llm_endpoint,
+            model=args.llm_model,
+            api_key=args.llm_api_key,
+        )
+    )
+    result = analyzer.analyze(markdown, args.question)
+    # Include user_input so the next script can consume this file alone.
+    payload = {
+        **asdict(result),
+        "user_input": args.question,
+        "markdown_path": str(Path(args.markdown)),
+    }
+    write_json(payload, args.output)
+
+
+if __name__ == "__main__":
+    main()
