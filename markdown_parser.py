@@ -486,12 +486,14 @@ class MarkdownParser:
         # 从这里开始处理字符串模板，不再递归结构，而是解析 {{...}}。
 
         # 情况 A：整个字符串恰好是一个变量，例如 "{{external.db_port}}"
+        # 或 "{{steps.Step1.result.blocking_session_id}}"（Step1->Step2 结果传递）
         # 使用 fullmatch，要求从头到尾完全匹配，不能有额外文字。
         full_match = VARIABLE_PATTERN.fullmatch(value)
         if full_match:
-            # group(1) 取出花括号内表达式，如 "external.db_port"
+            # group(1) 取出花括号内表达式，如 "steps.Step1.result.blocking_session_id"
             # strip() 去掉表达式两侧空格，兼容 "{{ external.db_port }}"
             # _lookup 在 context 中按路径查找对应值
+            # [步骤结果传递-模板替换] diagnosis.md InputFrom/Parameters 在此完成赋值
             found, resolved = self._lookup(full_match.group(1).strip(), context)
             # 找到则返回原类型值（可能是 int/dict/list），实现“类型保留”
             # 找不到则返回原模板字符串，留给后续步骤结果就绪后再解析
@@ -538,6 +540,12 @@ class MarkdownParser:
     def _lookup(
         self, expression: str, context: Mapping[str, Any]
     ) -> Tuple[bool, Any]:
+        # [步骤结果传递-路径查找]
+        # 对应 diagnosis.md 中的引用：
+        #   {{steps.Step1.result.blocking_session_id}}
+        # expression 会被按 "." 拆成：
+        #   ["steps", "Step1", "result", "blocking_session_id"]
+        # 然后在 context 中逐层取值，供 Step2 参数赋值使用。
         if expression == "user_input":
             return True, context["user_input"]
 

@@ -64,9 +64,21 @@
 5. `Parameters` 是传给自动化平台的业务参数模板。
 6. 外来参数使用 `{{external.<参数名>}}` 引用。
 7. 用户原始问题使用 `{{user_input}}` 引用。
-8. 前序步骤结果使用 `{{steps.<Step编号>.result.<字段路径>}}` 引用。
-9. Step 按文档中的编号顺序执行。执行后应以 Step 编号保存结果，供后续 Step 赋值。
+8. 前序步骤结果传递（本文件实现方式）：
+   - 上游 Step 通过 `Output: steps.<Step编号>.result` 声明结果保存位置。
+   - 上游 Step 通过 `PassTo` 声明哪些字段会传给后续 Step。
+   - 下游 Step 通过 `InputFrom` 声明参数来源。
+   - 下游 Step 在 `Parameters` 中用 `{{steps.<Step编号>.result.<字段>}}` 完成赋值。
+9. Step 按文档中的编号顺序执行。执行后必须以 Step 编号保存结果，供后续 Step 赋值。
 10. 密码、令牌等 `secret: true` 参数可以传递，但不得写入日志。
+
+步骤结果传递示例（Step1 -> Step2）：
+
+```text
+Step1.Output = steps.Step1.result
+Step1.PassTo = blocking_session_id -> Step2.Parameters.blocking_session_id
+Step2.InputFrom = blocking_session_id <- {{steps.Step1.result.blocking_session_id}}
+```
 
 外来参数赋值示例：当用户输入“生产库 10.10.20.15 出现锁等待，数据库名称 order_prod，登录用户 diagnosis_user”时，大模型应提取：
 
@@ -175,6 +187,12 @@ Parameters:
 }
 ```
 Output: steps.Step1.result
+OutputFields:
+- blocking_session_id: 阻塞源会话ID
+- summary: 诊断摘要
+PassTo:
+- blocking_session_id -> Step2.Parameters.blocking_session_id
+- result -> Step3.Parameters.diagnosis_result
 Retry: 2
 Timeout: 60
 OnError: stop
@@ -185,6 +203,8 @@ Description: 用户授权后，使用诊断编排返回的阻塞会话ID执行�
 ToolType: operation
 TargetName: db_lock_release_operation
 Condition: external.allow_recovery == true and steps.Step1.result.blocking_session_id exists
+InputFrom:
+- blocking_session_id <- steps.Step1.result.blocking_session_id
 Parameters:
 ```json
 {
@@ -198,6 +218,8 @@ Parameters:
 }
 ```
 Output: steps.Step2.result
+PassTo:
+- result -> Step3.Parameters.recovery_result
 Retry: 1
 Timeout: 30
 OnError: continue
@@ -208,6 +230,9 @@ Description: 汇总诊断编排和处置操作的结果，生成最终诊断报�
 ToolType: orchestration
 TargetName: db_lock_report_orchestration
 Condition: steps.Step1.result exists
+InputFrom:
+- diagnosis_result <- steps.Step1.result
+- recovery_result <- steps.Step2.result
 Parameters:
 ```json
 {
@@ -277,6 +302,12 @@ Parameters:
 }
 ```
 Output: steps.Step1.result
+OutputFields:
+- samples: 超时请求样本
+- statistics: 超时统计信息
+PassTo:
+- samples -> Step2.Parameters.timeout_samples
+- statistics -> Step2.Parameters.timeout_statistics
 Retry: 2
 Timeout: 30
 OnError: stop
@@ -287,6 +318,9 @@ Description: 将超时样本传给自动化平台中的原因分析编排。
 ToolType: orchestration
 TargetName: api_timeout_analysis_orchestration
 Condition: steps.Step1.result exists
+InputFrom:
+- timeout_samples <- steps.Step1.result.samples
+- timeout_statistics <- steps.Step1.result.statistics
 Parameters:
 ```json
 {

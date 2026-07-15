@@ -112,7 +112,15 @@ class PlatformExecutor:
                 user_input=user_input,
             )
             executions.append(execution)
-            # 来源：当前步骤平台调用返回值，供后续 Step 参数赋值
+            # [步骤结果传递-写回]
+            # 对应 diagnosis.md:
+            #   Output: steps.Step1.result
+            # 执行完 Step1 后，把平台返回值写入 context，供 Step2/Step3 读取。
+            # 例如：
+            #   context["steps"]["Step1"]["result"]["blocking_session_id"]
+            # 会被 Step2.Parameters 中的
+            #   {{steps.Step1.result.blocking_session_id}}
+            # 解析并赋值。
             context["steps"][execution.step_id] = {"result": execution.result}
 
             if execution.status == "failed" and raw_step.get("on_error") != "continue":
@@ -142,6 +150,10 @@ class PlatformExecutor:
         condition = str(step.get("condition") or "always")
 
         if not self.condition_evaluator.evaluate(condition, context):
+            # [步骤结果传递-条件判断]
+            # 对应 diagnosis.md Step2:
+            #   Condition: ... and steps.Step1.result.blocking_session_id exists
+            # 若 Step1 尚未产出该字段，则跳过 Step2。
             skipped = {"status": "skipped"}
             return StepExecution(
                 step_id=step_id,
@@ -155,6 +167,13 @@ class PlatformExecutor:
         template_parameters = step.get("parameters")
         if not isinstance(template_parameters, Mapping):
             template_parameters = {}
+        # [步骤结果传递-参数赋值]
+        # 对应 diagnosis.md Step2:
+        #   InputFrom:
+        #   - blocking_session_id <- steps.Step1.result.blocking_session_id
+        #   Parameters:
+        #     "blocking_session_id": "{{steps.Step1.result.blocking_session_id}}"
+        # _resolve_value 会把上述模板替换为 Step1 平台返回的真实值。
         assigned_parameters = self.parser._resolve_value(template_parameters, context)
 
         # 直接构造平台调用入参（平台侧接收已赋值参数）
@@ -170,8 +189,12 @@ class PlatformExecutor:
             # 来源说明：
             # - external.*     : llm_analyzer.py 提取，经 markdown_parser.py 绑定
             # - user_input     : llm_analyzer.py / markdown_parser.py 透传
-            # - steps.*.result : 前序平台调用返回结果
+            # - steps.*.result : 前序平台调用返回结果（diagnosis.md 的 InputFrom/PassTo）
             # - 字面量         : diagnosis.md 中写死的固定值
+            #
+            # Step1 -> Step2 示例：
+            #   key="blocking_session_id"
+            #   value=context["steps"]["Step1"]["result"]["blocking_session_id"]
             request[key] = value
 
         # 兼容显式外来参数直传：若模板未覆盖，但 external 中存在同名键，则直接赋值
