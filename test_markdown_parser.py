@@ -108,6 +108,42 @@ class MarkdownParserTests(unittest.TestCase):
                 {"db_ip": "10.0.0.8", "db_name": "orders"},
             )
 
+    def test_parse_key_values_keeps_target_name_and_condition_separate(self) -> None:
+        # Reproduces the bug: indented Condition was appended into TargetName
+        # as "value\\nCondition: ..." because key matching ignored leading spaces.
+        fields = self.parser._parse_key_values(
+            [
+                "Name: 诊断数据库锁等待",
+                "ToolType: orchestration",
+                "TargetName: db_lock_keyword_orchestration",
+                "  Condition: always",
+                "Parameters:",
+                "```json",
+                "{",
+                '  "db_ip": "{{external.db_ip}}",',
+                '  "note": "ToolType: must stay inside fence"',
+                "}",
+                "```",
+                "Output: steps.Step1.result",
+            ]
+        )
+
+        self.assertEqual(fields["TargetName"], "db_lock_keyword_orchestration")
+        self.assertEqual(fields["Condition"], "always")
+        self.assertNotIn("\n", fields["TargetName"])
+        self.assertIn("ToolType: must stay inside fence", fields["Parameters"])
+        self.assertEqual(fields["Output"], "steps.Step1.result")
+
+    def test_parse_key_values_supports_fullwidth_colon_for_condition(self) -> None:
+        fields = self.parser._parse_key_values(
+            [
+                "TargetName: db_lock_release_operation",
+                "Condition：external.allow_recovery == true",
+            ]
+        )
+        self.assertEqual(fields["TargetName"], "db_lock_release_operation")
+        self.assertEqual(fields["Condition"], "external.allow_recovery == true")
+
 
 if __name__ == "__main__":
     unittest.main()
