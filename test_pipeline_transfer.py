@@ -1,5 +1,3 @@
-import json
-import tempfile
 import unittest
 from pathlib import Path
 from typing import Any, Mapping, Optional
@@ -36,7 +34,7 @@ class FakeAutomationExecutor:
 
 
 class TransferPipelineTests(unittest.TestCase):
-    def test_markdown_parser_builds_plan_from_llm_result_file(self) -> None:
+    def test_markdown_parser_builds_plan_from_llm_result(self) -> None:
         llm_result = {
             "ability": "database_lock_wait",
             "external_parameters": {
@@ -49,26 +47,7 @@ class TransferPipelineTests(unittest.TestCase):
             "user_input": "10.10.20.15 order_prod 出现锁等待",
         }
 
-        with tempfile.TemporaryDirectory() as tmp:
-            llm_path = Path(tmp) / "llm_result.json"
-            plan_path = Path(tmp) / "plan.json"
-            llm_path.write_text(
-                json.dumps(llm_result, ensure_ascii=False), encoding="utf-8"
-            )
-
-            from markdown_parser import main as parser_main
-
-            parser_main(
-                [
-                    "--markdown",
-                    str(Path(__file__).with_name("diagnosis.md")),
-                    "--llm-result",
-                    str(llm_path),
-                    "--output",
-                    str(plan_path),
-                ]
-            )
-            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        plan = MarkdownParser().build_transfer_plan(MARKDOWN, llm_result)
 
         self.assertEqual(plan["ability"], "database_lock_wait")
         self.assertEqual(plan["external_parameters"]["db_port"], 5432)
@@ -78,7 +57,7 @@ class TransferPipelineTests(unittest.TestCase):
         )
         self.assertEqual(plan["steps"][0]["request"]["db_ip"], "10.10.20.15")
 
-    def test_platform_executor_consumes_parser_plan(self) -> None:
+    def test_platform_executor_assigns_external_parameters_and_calls_platform(self) -> None:
         llm_result = {
             "ability": "database_lock_wait",
             "external_parameters": {
@@ -98,6 +77,10 @@ class TransferPipelineTests(unittest.TestCase):
             ["success", "success", "success"],
         )
         self.assertEqual(len(fake.calls), 3)
+        first_request = fake.calls[0][0]
+        self.assertEqual(first_request["db_ip"], "10.10.20.15")
+        self.assertEqual(first_request["db_name"], "order_prod")
+        self.assertEqual(first_request["db_user"], "diagnosis_user")
         self.assertEqual(
             fake.calls[1][0]["blocking_session_id"], "session-123"
         )

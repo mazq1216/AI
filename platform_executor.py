@@ -1,17 +1,25 @@
-"""Independently execute automation-platform orchestration/operation plans."""
+"""Call local automation-platform orchestration/operation APIs.
+
+This script does not provide CLI/command-line entrypoints.
+It receives a plan produced by ``markdown_parser.py`` and directly assigns
+business parameters into each platform request.
+
+Parameter sources:
+- ``toolType`` / ``TargetName``: from ``diagnosis.md`` via ``markdown_parser.py``
+- business fields such as ``db_ip`` / ``db_name``: from ``llm_analyzer.py``
+  external-parameter extraction, then bound/validated by ``markdown_parser.py``
+- previous-step fields such as ``blocking_session_id``: from earlier platform
+  call results stored in the running context
+"""
 
 from __future__ import annotations
 
-import argparse
 from dataclasses import asdict, dataclass
 import json
-import os
-from pathlib import Path
 import re
-import sys
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
-from automation_executor import AutomationExecutor, HttpAutomationExecutor
+from automation_executor import AutomationExecutor
 from markdown_parser import MarkdownParser
 
 
@@ -67,7 +75,7 @@ class ConditionEvaluator:
 
 
 class PlatformExecutor:
-    """Execute a MarkdownParser transfer plan against the local automation platform."""
+    """Execute a MarkdownParser transfer plan via platform API calls only."""
 
     def __init__(self, executor: AutomationExecutor) -> None:
         self.executor = executor
@@ -79,9 +87,17 @@ class PlatformExecutor:
         if not isinstance(steps, list) or not steps:
             raise ValueError("Plan must contain a non-empty steps array")
 
+        # 来源：markdown_parser.py 输出的 plan["external_parameters"]
+        # （原始值来自 llm_analyzer.py 的 external_parameters，经 Parser 校验/默认值绑定）
+        external_parameters = dict(plan.get("external_parameters") or {})
+
+        # 来源：markdown_parser.py 输出的 plan["user_input"]
+        # （通常透传自 llm_analyzer.py 的 user_input）
+        user_input = plan.get("user_input") or ""
+
         context: Dict[str, Any] = {
-            "external": dict(plan.get("external_parameters") or {}),
-            "user_input": plan.get("user_input") or "",
+            "external": external_parameters,
+            "user_input": user_input,
             "steps": {},
         }
         executions: List[StepExecution] = []
@@ -89,8 +105,14 @@ class PlatformExecutor:
         for raw_step in steps:
             if not isinstance(raw_step, Mapping):
                 raise ValueError("Each plan step must be an object")
-            execution = self._execute_one_step(raw_step, context)
+            execution = self._execute_one_step(
+                raw_step,
+                context,
+                external_parameters=external_parameters,
+                user_input=user_input,
+            )
             executions.append(execution)
+            # 来源：当前步骤平台调用返回值，供后续 Step 参数赋值
             context["steps"][execution.step_id] = {"result": execution.result}
 
             if execution.status == "failed" and raw_step.get("on_error") != "continue":
@@ -102,13 +124,18 @@ class PlatformExecutor:
         return {
             "ability": plan.get("ability"),
             "reasoning": plan.get("reasoning"),
-            "user_input": plan.get("user_input"),
+            "user_input": user_input,
             "steps": [asdict(item) for item in executions],
         }
 
     def _execute_one_step(
-        self, step: Mapping[str, Any], context: Mapping[str, Any]
+        self,
+        step: Mapping[str, Any],
+        context: Mapping[str, Any],
+        external_parameters: Mapping[str, Any],
+        user_input: str,
     ) -> StepExecution:
+        # 来源：diagnosis.md -> markdown_parser.py 生成的 plan.steps[*]
         step_id = str(step.get("id") or "Step")
         tool_type = str(step.get("toolType") or "")
         target_name = str(step.get("TargetName") or "")
@@ -124,14 +151,34 @@ class PlatformExecutor:
                 result=skipped,
             )
 
-        parameters = step.get("parameters")
-        if not isinstance(parameters, Mapping):
-            parameters = {}
-        request = {
+        # 平台支持直接参数赋值输入：先解析模板，再显式赋值到请求体
+        template_parameters = step.get("parameters")
+        if not isinstance(template_parameters, Mapping):
+            template_parameters = {}
+        assigned_parameters = self.parser._resolve_value(template_parameters, context)
+
+        # 直接构造平台调用入参（平台侧接收已赋值参数）
+        request: Dict[str, Any] = {
+            # 来源：diagnosis.md / markdown_parser.py
             "toolType": tool_type,
+            # 来源：diagnosis.md / markdown_parser.py
             "TargetName": target_name,
         }
-        request.update(self.parser._resolve_value(parameters, context))
+
+        # 将业务参数直接赋值进平台请求；值来源见各字段注释
+        for key, value in assigned_parameters.items():
+            # 来源说明：
+            # - external.*     : llm_analyzer.py 提取，经 markdown_parser.py 绑定
+            # - user_input     : llm_analyzer.py / markdown_parser.py 透传
+            # - steps.*.result : 前序平台调用返回结果
+            # - 字面量         : diagnosis.md 中写死的固定值
+            request[key] = value
+
+        # 兼容显式外来参数直传：若模板未覆盖，但 external 中存在同名键，则直接赋值
+        for key, value in external_parameters.items():
+            if key not in request:
+                # 来源：llm_analyzer.py -> markdown_parser.py(external_parameters)
+                request[key] = value
 
         unresolved = self.parser.parse_variable(json.dumps(request, ensure_ascii=False))
         if unresolved:
@@ -146,6 +193,7 @@ class PlatformExecutor:
 
         for _ in range(attempts):
             try:
+                # 仅做平台调用：把已赋值参数提交给自动化平台
                 result = self.executor.execute(request, timeout=timeout_value)
                 return StepExecution(
                     step_id=step_id,
@@ -168,72 +216,36 @@ class PlatformExecutor:
         )
 
 
-def load_json_payload(source: str) -> Dict[str, Any]:
-    if source == "-":
-        text = sys.stdin.read()
-    else:
-        text = Path(source).read_text(encoding="utf-8")
-    data = json.loads(text)
-    if not isinstance(data, dict):
-        raise ValueError("JSON payload must be an object")
-    return data
+def build_platform_request_example() -> Dict[str, Any]:
+    """Example of direct parameter assignment for one platform call.
 
+    Values below are placeholders. In real flow they come from:
+    - llm_analyzer.py result
+    - markdown_parser.py transfer plan
+    """
+    # 来源：llm_analyzer.py -> markdown_parser.py(external_parameters)
+    db_ip = "10.10.20.15"
+    # 来源：llm_analyzer.py -> markdown_parser.py(external_parameters)，默认值可能来自 diagnosis.md
+    db_port = 5432
+    # 来源：llm_analyzer.py -> markdown_parser.py(external_parameters)
+    db_name = "order_prod"
+    # 来源：llm_analyzer.py -> markdown_parser.py(external_parameters)
+    db_user = "diagnosis_user"
+    # 来源：llm_analyzer.py 透传的 user_input
+    problem_description = "生产库出现锁等待"
 
-def write_json(payload: Mapping[str, Any], output: str) -> None:
-    text = json.dumps(payload, ensure_ascii=False, indent=2)
-    if output == "-":
-        print(text)
-        return
-    Path(output).write_text(text + "\n", encoding="utf-8")
+    # 来源：diagnosis.md / markdown_parser.py
+    tool_type = "orchestration"
+    # 来源：diagnosis.md / markdown_parser.py
+    target_name = "db_lock_keyword_orchestration"
 
-
-def build_argument_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Independently execute a MarkdownParser transfer plan on the "
-            "local automation platform"
-        )
-    )
-    parser.add_argument(
-        "--plan",
-        required=True,
-        help="JSON file produced by markdown_parser.py, or '-' for stdin",
-    )
-    parser.add_argument(
-        "--output",
-        default="-",
-        help="Where to write execution result JSON: file path or '-' for stdout",
-    )
-    parser.add_argument(
-        "--automation-endpoint",
-        default=os.getenv("AUTOMATION_ENDPOINT"),
-        help="Local automation platform execution endpoint",
-    )
-    parser.add_argument(
-        "--automation-token",
-        default=os.getenv("AUTOMATION_TOKEN"),
-        help="Optional automation platform token",
-    )
-    return parser
-
-
-def main(argv: Optional[List[str]] = None) -> None:
-    args = build_argument_parser().parse_args(argv)
-    if not args.automation_endpoint:
-        raise SystemExit(
-            "Missing configuration: --automation-endpoint/AUTOMATION_ENDPOINT"
-        )
-
-    plan = load_json_payload(args.plan)
-    executor = PlatformExecutor(
-        HttpAutomationExecutor(
-            endpoint=args.automation_endpoint,
-            token=args.automation_token,
-        )
-    )
-    result = executor.execute_plan(plan)
-    write_json(result, args.output)
-
-
-if __name__ == "__main__":
-    main()
+    # 平台入参：直接赋值，不再走命令行封装
+    return {
+        "toolType": tool_type,
+        "TargetName": target_name,
+        "db_ip": db_ip,
+        "db_port": db_port,
+        "db_name": db_name,
+        "db_user": db_user,
+        "problem_description": problem_description,
+    }
